@@ -15,7 +15,7 @@ concurrency:
 jobs:
   build:
     name: Build Windows 11 ISO
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     timeout-minutes: 480
     permissions:
       contents: write
@@ -29,174 +29,182 @@ jobs:
 
     steps:
       - name: Free disk space
-        uses: jlumbroso/free-disk-space@v1.3.1
-        with:
-          tool-cache: false
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: true
-          swap-storage: false
-
-      - name: Check available disk space
-        run: df -h
-
-      - name: Install dependencies
+        shell: pwsh
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            aria2 \
-            cabextract \
-            wimtools \
-            genisoimage \
-            chntpw \
-            jq \
-            p7zip-full \
-            xmlstarlet
+          $toRemove = @(
+            'C:\Android',
+            'C:\hostedtoolcache\windows\go',
+            'C:\hostedtoolcache\windows\Ruby',
+            'C:\hostedtoolcache\windows\node',
+            'C:\hostedtoolcache\windows\PyPy',
+            'C:\Haskell',
+            'C:\ghcup',
+            'C:\ProgramData\chocolatey\lib\llvm',
+            'C:\ProgramData\chocolatey\lib\mingw',
+            'C:\ProgramData\MySQL',
+            'C:\ProgramData\PostgreSQL',
+            'C:\Program Files\MongoDB',
+            'C:\Program Files\LLVM'
+          )
+          foreach ($p in $toRemove) {
+            if (Test-Path $p) {
+              Write-Host "Removing: $p"
+              Remove-Item -Recurse -Force $p -ErrorAction SilentlyContinue
+            }
+          }
+          Get-PSDrive C, D -ErrorAction SilentlyContinue |
+            Select-Object Name,
+              @{N='Free(GB)'; E={[math]::Round($_.Free/1GB, 1)}},
+              @{N='Used(GB)'; E={[math]::Round($_.Used/1GB, 1)}}
+
+      - name: Install aria2
+        shell: pwsh
+        run: |
+          choco install aria2 --yes --no-progress
+          aria2c --version | Select-Object -First 1
 
       - name: Resolve build ID
         id: build
+        shell: pwsh
         run: |
-          if [[ -n "${{ inputs.build_id }}" ]]; then
-            BUILD_ID="${{ inputs.build_id }}"
-            TITLE="Windows 11 ($BUILD_ID)"
-            BUILD_NUM="$BUILD_ID"
-          else
-            echo "Querying UUP dump API for latest Windows 11 retail build..."
-            RESPONSE=$(curl -sfL \
-              "https://api.uupdump.net/fetchupd.php?arch=${{ env.ARCH }}&ring=RETAIL&flight=Active")
-            echo "Raw response: $RESPONSE"
+          $buildId = '${{ inputs.build_id }}'
 
-            # Pick the first Windows 11 build (build >= 22000)
-            BUILD_ID=$(echo "$RESPONSE" | jq -r '
-              .response.updateArray[]
-              | select(.build >= "22000")
-              | .uuid' | head -1)
-            TITLE=$(echo "$RESPONSE" | jq -r '
-              .response.updateArray[]
-              | select(.build >= "22000")
-              | .title' | head -1)
-            BUILD_NUM=$(echo "$RESPONSE" | jq -r '
-              .response.updateArray[]
-              | select(.build >= "22000")
-              | .build' | head -1)
+          if ($buildId) {
+            $title    = "Windows 11 ($buildId)"
+            $buildNum = $buildId
+          } else {
+            Write-Host "Querying UUP dump API for latest Windows 11 retail build..."
+            $resp = Invoke-RestMethod `
+              "https://api.uupdump.net/fetchupd.php?arch=${{ env.ARCH }}&ring=RETAIL&flight=Active"
 
-            # Fallback: listid search
-            if [[ -z "$BUILD_ID" ]]; then
-              echo "Fallback: searching via listid..."
-              RESPONSE=$(curl -sfL \
-                "https://api.uupdump.net/listid.php?search=Windows+11&sortByDate=1")
-              BUILD_ID=$(echo "$RESPONSE" | jq -r \
-                '[.response.builds | to_entries[] | .value] | sort_by(.created) | reverse | .[0].uuid')
-              TITLE=$(echo "$RESPONSE" | jq -r \
-                '[.response.builds | to_entries[] | .value] | sort_by(.created) | reverse | .[0].title')
-              BUILD_NUM=$(echo "$RESPONSE" | jq -r \
-                '[.response.builds | to_entries[] | .value] | sort_by(.created) | reverse | .[0].build')
-            fi
-          fi
+            $update = $resp.response.updateArray |
+              Where-Object { [System.Version]($_.build + '.0') -ge [System.Version]'22000.0' } |
+              Select-Object -First 1
 
-          echo "Build ID : $BUILD_ID"
-          echo "Title    : $TITLE"
-          echo "Build    : $BUILD_NUM"
+            if (-not $update) {
+              Write-Host "Fallback: searching via listid..."
+              $resp   = Invoke-RestMethod `
+                "https://api.uupdump.net/listid.php?search=Windows+11&sortByDate=1"
+              $update = $resp.response.builds.PSObject.Properties.Value |
+                Sort-Object created -Descending |
+                Select-Object -First 1
+            }
 
-          echo "id=$BUILD_ID"         >> "$GITHUB_OUTPUT"
-          echo "title=$TITLE"         >> "$GITHUB_OUTPUT"
-          echo "build_num=$BUILD_NUM" >> "$GITHUB_OUTPUT"
+            $buildId  = $update.uuid
+            $title    = $update.title
+            $buildNum = $update.build
+          }
+
+          Write-Host "Build ID  : $buildId"
+          Write-Host "Title     : $title"
+          Write-Host "Build     : $buildNum"
+
+          "id=$buildId"         >> $env:GITHUB_OUTPUT
+          "title=$title"        >> $env:GITHUB_OUTPUT
+          "build_num=$buildNum" >> $env:GITHUB_OUTPUT
 
       - name: Download UUP dump conversion package
+        shell: pwsh
         run: |
-          BUILD_ID="${{ steps.build.outputs.id }}"
-          # Encode semicolons for the URL
-          EDITIONS_URL="${{ env.EDITIONS }}"
-          EDITIONS_URL="${EDITIONS_URL//;/%3B}"
+          $buildId     = '${{ steps.build.outputs.id }}'
+          $editionsUrl = '${{ env.EDITIONS }}' -replace ';', '%3B'
+          $url = "https://uupdump.net/get.php?id=${buildId}&pack=${{ env.LANG_CODE }}&edition=${editionsUrl}&autodl=2"
 
-          echo "Downloading conversion package for $BUILD_ID ..."
-          curl -sfL \
-            "https://uupdump.net/get.php?id=${BUILD_ID}&pack=${{ env.LANG_CODE }}&edition=${EDITIONS_URL}&autodl=2" \
-            -o uup_package.zip
+          Write-Host "Downloading package for build: $buildId"
+          Invoke-WebRequest -Uri $url -OutFile uup_package.zip
 
-          echo "Package: $(du -h uup_package.zip | cut -f1)"
-          unzip -o uup_package.zip
-          ls -la
+          $mb = [math]::Round((Get-Item uup_package.zip).Length / 1MB, 1)
+          Write-Host "Package size: ${mb} MB"
+
+          Expand-Archive uup_package.zip -DestinationPath . -Force
+          Get-ChildItem
 
       - name: Configure conversion options
+        shell: pwsh
         run: |
-          if [[ ! -f ConvertConfig.ini ]]; then
-            echo "ConvertConfig.ini not found — skipping config step"
-            ls -la
-          else
-            # Include updates
-            sed -i '/^AddUpdates=/s/.*/AddUpdates=1/' ConvertConfig.ini
-            # Component cleanup
-            sed -i '/^Cleanup=/s/.*/Cleanup=1/' ConvertConfig.ini
-            # .NET Framework 3.5
-            sed -i '/^NetFx3=/s/.*/NetFx3=1/' ConvertConfig.ini
-            # Apply LCU to WinRE
-            sed -i '/^LCUwinre=/s/.*/LCUwinre=1/' ConvertConfig.ini
-            echo "--- ConvertConfig.ini ---"
-            cat ConvertConfig.ini
-          fi
+          if (-not (Test-Path ConvertConfig.ini)) {
+            Write-Host "ConvertConfig.ini not found — skipping"
+            Get-ChildItem
+          } else {
+            $cfg = Get-Content ConvertConfig.ini
+            $cfg = $cfg -replace '^AddUpdates=.*', 'AddUpdates=1'
+            $cfg = $cfg -replace '^Cleanup=.*',    'Cleanup=1'
+            $cfg = $cfg -replace '^NetFx3=.*',     'NetFx3=1'
+            $cfg = $cfg -replace '^LCUwinre=.*',   'LCUwinre=1'
+            Set-Content ConvertConfig.ini $cfg -Encoding UTF8
+            Write-Host "--- ConvertConfig.ini ---"
+            Get-Content ConvertConfig.ini
+          }
 
       - name: Run download and conversion
-        run: |
-          chmod +x uup_download_linux.sh
-          bash uup_download_linux.sh 2>&1 | tee build.log
-          echo "--- Disk usage after conversion ---"
-          df -h
+        shell: cmd
+        run: uup_download_windows.cmd
 
       - name: Locate ISO file
         id: iso
+        shell: pwsh
         run: |
-          ISO=$(ls *.iso 2>/dev/null | head -1)
-          if [[ -z "$ISO" ]]; then
-            echo "::error::No ISO file produced. Tail of build log:"
-            tail -100 build.log
+          $iso = Get-ChildItem *.iso -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $iso) {
+            Write-Error "No ISO file produced after conversion!"
+            Get-ChildItem
             exit 1
-          fi
-          echo "ISO: $ISO  ($(du -h "$ISO" | cut -f1))"
-          echo "file=$ISO" >> "$GITHUB_OUTPUT"
+          }
+          $gb = [math]::Round($iso.Length / 1GB, 2)
+          Write-Host "ISO: $($iso.Name)  ($gb GB)"
+          "file=$($iso.Name)" >> $env:GITHUB_OUTPUT
 
       - name: Split ISO into 2 GB chunks
         id: split
+        shell: pwsh
         run: |
-          ISO="${{ steps.iso.outputs.file }}"
-          BASE="${ISO%.iso}"
+          $isoPath   = '${{ steps.iso.outputs.file }}'
+          $base      = [IO.Path]::GetFileNameWithoutExtension($isoPath)
+          $chunkSize = 2000 * 1024 * 1024   # 2000 MiB
+          $buffer    = New-Object byte[] $chunkSize
+          $partNum   = 1
 
-          split -b 2000M --numeric-suffixes=1 --suffix-length=3 "$ISO" "${BASE}.part"
-          rm "$ISO"
+          $reader = [IO.File]::OpenRead($isoPath)
+          while ($reader.Position -lt $reader.Length) {
+            $partFile  = "${base}.part{0:D3}" -f $partNum
+            $bytesRead = $reader.Read($buffer, 0, $buffer.Length)
+            $writer    = [IO.File]::OpenWrite($partFile)
+            $writer.Write($buffer, 0, $bytesRead)
+            $writer.Close()
+            $mb = [math]::Round((Get-Item $partFile).Length / 1MB)
+            Write-Host "Created: $partFile  (${mb} MB)"
+            $partNum++
+          }
+          $reader.Close()
+          Remove-Item $isoPath
 
-          CHUNKS=$(ls "${BASE}.part"* | wc -l)
-          echo "Split into $CHUNKS chunks:"
-          ls -lah "${BASE}.part"*
-
-          echo "basename=$BASE"   >> "$GITHUB_OUTPUT"
-          echo "chunks=$CHUNKS"   >> "$GITHUB_OUTPUT"
+          $chunks = $partNum - 1
+          Write-Host "Split into $chunks chunks"
+          "basename=$base"  >> $env:GITHUB_OUTPUT
+          "chunks=$chunks"  >> $env:GITHUB_OUTPUT
 
       - name: Create GitHub release
         id: release
+        shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          BUILD_ID="${{ steps.build.outputs.id }}"
-          TITLE="${{ steps.build.outputs.title }}"
-          BUILD_NUM="${{ steps.build.outputs.build_num }}"
-          CHUNKS="${{ steps.split.outputs.chunks }}"
-          TAG="win11-$(date -u +%Y%m%d-%H%M%S)"
+          $buildId  = '${{ steps.build.outputs.id }}'
+          $title    = '${{ steps.build.outputs.title }}'
+          $buildNum = '${{ steps.build.outputs.build_num }}'
+          $chunks   = '${{ steps.split.outputs.chunks }}'
+          $tag      = "win11-$((Get-Date).ToUniversalTime().ToString('yyyyMMdd-HHmmss'))"
 
-          gh release create "$TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "$TITLE" \
-            --latest \
-            --notes "## $TITLE
+          @"
+          ## $title
 
           | Field | Value |
           |-------|-------|
-          | Build ID | \`${BUILD_ID}\` |
-          | Build number | ${BUILD_NUM} |
+          | Build ID | ``$buildId`` |
+          | Build number | $buildNum |
           | Language | English (United States) |
           | Architecture | amd64 |
-          | Parts | ${CHUNKS} × 2 GB |
+          | Parts | $chunks x 2 GB |
 
           ### Editions included
           - Windows Home
@@ -217,40 +225,47 @@ jobs:
           - Solid (ESD) compression
 
           ### Reassemble ISO
-          \`\`\`bash
+          ```powershell
+          # PowerShell (Windows)
+          `$out = [IO.File]::Create('Windows11.iso')
+          Get-ChildItem *.part* | Sort-Object Name | ForEach-Object {
+              `$bytes = [IO.File]::ReadAllBytes(`$_.FullName)
+              `$out.Write(`$bytes, 0, `$bytes.Length)
+          }
+          `$out.Close()
+          ```
+          ```bash
           # Linux / macOS
           cat *.part* > Windows11.iso
-          \`\`\`
-          \`\`\`powershell
-          # PowerShell (Windows)
-          \$out = [IO.File]::Create('Windows11.iso')
-          Get-ChildItem *.part* | Sort-Object Name | ForEach-Object {
-              \$bytes = [IO.File]::ReadAllBytes(\$_.FullName)
-              \$out.Write(\$bytes, 0, \$bytes.Length)
-          }
-          \$out.Close()
-          \`\`\`"
+          ```
+          "@ | Out-File notes.md -Encoding UTF8
 
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          gh release create $tag `
+            --repo $env:GITHUB_REPOSITORY `
+            --title $title `
+            --notes-file notes.md `
+            --latest
+
+          "tag=$tag" >> $env:GITHUB_OUTPUT
 
       - name: Upload chunks to release
+        shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="${{ steps.release.outputs.tag }}"
-          BASE="${{ steps.split.outputs.basename }}"
+          $tag  = '${{ steps.release.outputs.tag }}'
+          $base = '${{ steps.split.outputs.basename }}'
 
-          for chunk in "${BASE}.part"*; do
-            echo "Uploading $chunk  ($(du -h "$chunk" | cut -f1)) ..."
-            gh release upload "$TAG" "$chunk" \
-              --repo "$GITHUB_REPOSITORY" \
-              --clobber
-          done
+          Get-ChildItem "${base}.part*" | Sort-Object Name | ForEach-Object {
+            $mb = [math]::Round($_.Length / 1MB)
+            Write-Host "Uploading $($_.Name)  (${mb} MB) ..."
+            gh release upload $tag $_.FullName --repo $env:GITHUB_REPOSITORY --clobber
+          }
 
       - name: Upload build log artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: build-log-${{ github.run_id }}
-          path: build.log
+          path: "*.log"
           retention-days: 7
