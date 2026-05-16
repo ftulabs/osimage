@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       build_id:
-        description: 'UUP dump build ID (leave empty for latest Windows 11)'
+        description: 'UUP dump build ID (leave empty for latest retail Windows 11)'
         required: false
         type: string
 
@@ -19,13 +19,6 @@ jobs:
     timeout-minutes: 480
     permissions:
       contents: write
-
-    env:
-      LANG_CODE: en-us
-      ARCH: amd64
-      # Home, Pro, Home SL, Pro for Workstations, Pro Education, Education,
-      # Enterprise, Enterprise multi-session, IoT Enterprise, IoT Enterprise Subscription
-      EDITIONS: "core;professional;coresinglelanguage;professionalworkstation;professionalEducation;education;enterprise;serverrdsh;iotenterprise;iotenterprises"
 
     steps:
       - name: Free disk space
@@ -73,30 +66,43 @@ jobs:
             $title    = "Windows 11 ($buildId)"
             $buildNum = $buildId
           } else {
-            Write-Host "Searching UUP dump for latest Windows 11 amd64 build..."
-            $resp = Invoke-RestMethod `
-              "https://api.uupdump.net/listid.php?search=Windows+11&sortByDate=1"
+            # fetchupd.php?arch=amd64&ring=retail returns an HTML page listing retail builds.
+            # Parse UUIDs and build numbers, then pick the highest build for amd64.
+            Write-Host "Fetching latest retail Windows 11 builds..."
+            $html = Invoke-WebRequest -Uri "https://uupdump.net/fetchupd.php?arch=amd64&ring=retail" |
+              Select-Object -ExpandProperty Content
 
-            # builds is a dict keyed by UUID; grab values, filter amd64, take newest
-            $update = $resp.response.builds.PSObject.Properties.Value |
-              Where-Object { $_.arch -eq 'amd64' } |
-              Sort-Object created -Descending |
-              Select-Object -First 1
+            $uuids  = [regex]::Matches($html, '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}') |
+              ForEach-Object { $_.Value } | Select-Object -Unique
+            $builds = [regex]::Matches($html, '\b(2[2-9]\d{3}\.\d+)\b') |
+              ForEach-Object { $_.Value } | Select-Object -Unique
 
-            if (-not $update) {
-              Write-Error "No Windows 11 amd64 build found via UUP dump API."
+            Write-Host "UUIDs  : $($uuids -join ', ')"
+            Write-Host "Builds : $($builds -join ', ')"
+
+            if (-not $uuids) {
+              Write-Error "No builds found on fetchupd.php. Check the URL or try specifying build_id manually."
               exit 1
             }
 
-            $buildId  = $update.uuid
-            $title    = $update.title
-            $buildNum = $update.build
+            # For each UUID check its build number via the API, pick the highest
+            $best = $null
+            foreach ($uuid in $uuids) {
+              $info = Invoke-RestMethod "https://api.uupdump.net/listlangs.php?id=$uuid"
+              $b    = $info.response.updateInfo.build
+              $t    = $info.response.updateInfo.title
+              Write-Host "  $uuid -> $b  $t"
+              if (-not $best -or ([version]($b + '.0') -gt [version]($best.build + '.0'))) {
+                $best = [PSCustomObject]@{ uuid=$uuid; build=$b; title=$t }
+              }
+            }
+
+            $buildId  = $best.uuid
+            $buildNum = $best.build
+            $title    = $best.title
           }
 
-          Write-Host "Build ID  : $buildId"
-          Write-Host "Title     : $title"
-          Write-Host "Build     : $buildNum"
-
+          Write-Host "Selected: $buildId  ($buildNum)  $title"
           "id=$buildId"         >> $env:GITHUB_OUTPUT
           "title=$title"        >> $env:GITHUB_OUTPUT
           "build_num=$buildNum" >> $env:GITHUB_OUTPUT
@@ -104,35 +110,33 @@ jobs:
       - name: Download UUP dump conversion package
         shell: pwsh
         run: |
-          $buildId     = '${{ steps.build.outputs.id }}'
-          $editionsUrl = '${{ env.EDITIONS }}' -replace ';', '%3B'
-          $url = "https://uupdump.net/get.php?id=${buildId}&pack=${{ env.LANG_CODE }}&edition=${editionsUrl}&autodl=2"
+          $buildId = '${{ steps.build.outputs.id }}'
 
-          Write-Host "Downloading package for build: $buildId"
-          Invoke-WebRequest -Uri $url -OutFile uup_package.zip
+          # The form action has id/pack/edition as query-string; conversion options
+          # and virtualEditions[] go in the POST body — server pre-fills ConvertConfig.ini.
+          $uri  = "https://uupdump.net/get.php?id=${buildId}&pack=en-us&edition=core%3Bprofessional"
+          $body = "autodl=2&updates=1&cleanup=1&netfx=1&esd=1" +
+                  "&virtualEditions%5B%5D=CoreSingleLanguage" +
+                  "&virtualEditions%5B%5D=ProfessionalWorkstation" +
+                  "&virtualEditions%5B%5D=ProfessionalEducation" +
+                  "&virtualEditions%5B%5D=Education" +
+                  "&virtualEditions%5B%5D=Enterprise" +
+                  "&virtualEditions%5B%5D=ServerRdsh" +
+                  "&virtualEditions%5B%5D=IoTEnterprise" +
+                  "&virtualEditions%5B%5D=IoTEnterpriseK"
+
+          Write-Host "Downloading conversion package for build $buildId ..."
+          Invoke-WebRequest -Uri $uri -Method POST -Body $body `
+            -ContentType 'application/x-www-form-urlencoded' `
+            -OutFile uup_package.zip
 
           $mb = [math]::Round((Get-Item uup_package.zip).Length / 1MB, 1)
-          Write-Host "Package size: ${mb} MB"
+          Write-Host "Package: ${mb} MB"
 
           Expand-Archive uup_package.zip -DestinationPath . -Force
-          Get-ChildItem
 
-      - name: Configure conversion options
-        shell: pwsh
-        run: |
-          if (-not (Test-Path ConvertConfig.ini)) {
-            Write-Host "ConvertConfig.ini not found — skipping"
-            Get-ChildItem
-          } else {
-            $cfg = Get-Content ConvertConfig.ini
-            $cfg = $cfg -replace '^AddUpdates=.*', 'AddUpdates=1'
-            $cfg = $cfg -replace '^Cleanup=.*',    'Cleanup=1'
-            $cfg = $cfg -replace '^NetFx3=.*',     'NetFx3=1'
-            $cfg = $cfg -replace '^LCUwinre=.*',   'LCUwinre=1'
-            Set-Content ConvertConfig.ini $cfg -Encoding UTF8
-            Write-Host "--- ConvertConfig.ini ---"
-            Get-Content ConvertConfig.ini
-          }
+          Write-Host "--- ConvertConfig.ini (server-generated) ---"
+          Get-Content ConvertConfig.ini
 
       - name: Run download and conversion
         shell: cmd
@@ -214,7 +218,7 @@ jobs:
           - Windows Enterprise
           - Windows Enterprise multi-session / Virtual Desktops
           - Windows IoT Enterprise
-          - Windows IoT Enterprise Subscription
+          - Windows IoT Enterprise Subscription (IoTEnterpriseK)
 
           ### Conversion options applied
           - Updates integrated
