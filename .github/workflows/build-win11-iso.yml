@@ -1,0 +1,256 @@
+name: Build Windows 11 ISO
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        description: 'UUP dump build ID (leave empty for latest Windows 11)'
+        required: false
+        type: string
+
+concurrency:
+  group: win11-iso-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build Windows 11 ISO
+    runs-on: ubuntu-latest
+    timeout-minutes: 480
+    permissions:
+      contents: write
+
+    env:
+      LANG_CODE: en-us
+      ARCH: amd64
+      # Home, Pro, Home SL, Pro for Workstations, Pro Education, Education,
+      # Enterprise, Enterprise multi-session, IoT Enterprise, IoT Enterprise Subscription
+      EDITIONS: "core;professional;coresinglelanguage;professionalworkstation;professionalEducation;education;enterprise;serverrdsh;iotenterprise;iotenterprises"
+
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+
+      - name: Check available disk space
+        run: df -h
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            aria2 \
+            cabextract \
+            wimtools \
+            genisoimage \
+            chntpw \
+            jq \
+            p7zip-full \
+            xmlstarlet
+
+      - name: Resolve build ID
+        id: build
+        run: |
+          if [[ -n "${{ inputs.build_id }}" ]]; then
+            BUILD_ID="${{ inputs.build_id }}"
+            TITLE="Windows 11 ($BUILD_ID)"
+            BUILD_NUM="$BUILD_ID"
+          else
+            echo "Querying UUP dump API for latest Windows 11 retail build..."
+            RESPONSE=$(curl -sfL \
+              "https://api.uupdump.net/fetchupd.php?arch=${{ env.ARCH }}&ring=RETAIL&flight=Active")
+            echo "Raw response: $RESPONSE"
+
+            # Pick the first Windows 11 build (build >= 22000)
+            BUILD_ID=$(echo "$RESPONSE" | jq -r '
+              .response.updateArray[]
+              | select(.build >= "22000")
+              | .uuid' | head -1)
+            TITLE=$(echo "$RESPONSE" | jq -r '
+              .response.updateArray[]
+              | select(.build >= "22000")
+              | .title' | head -1)
+            BUILD_NUM=$(echo "$RESPONSE" | jq -r '
+              .response.updateArray[]
+              | select(.build >= "22000")
+              | .build' | head -1)
+
+            # Fallback: listid search
+            if [[ -z "$BUILD_ID" ]]; then
+              echo "Fallback: searching via listid..."
+              RESPONSE=$(curl -sfL \
+                "https://api.uupdump.net/listid.php?search=Windows+11&sortByDate=1")
+              BUILD_ID=$(echo "$RESPONSE" | jq -r \
+                '[.response.builds | to_entries[] | .value] | sort_by(.created) | reverse | .[0].uuid')
+              TITLE=$(echo "$RESPONSE" | jq -r \
+                '[.response.builds | to_entries[] | .value] | sort_by(.created) | reverse | .[0].title')
+              BUILD_NUM=$(echo "$RESPONSE" | jq -r \
+                '[.response.builds | to_entries[] | .value] | sort_by(.created) | reverse | .[0].build')
+            fi
+          fi
+
+          echo "Build ID : $BUILD_ID"
+          echo "Title    : $TITLE"
+          echo "Build    : $BUILD_NUM"
+
+          echo "id=$BUILD_ID"         >> "$GITHUB_OUTPUT"
+          echo "title=$TITLE"         >> "$GITHUB_OUTPUT"
+          echo "build_num=$BUILD_NUM" >> "$GITHUB_OUTPUT"
+
+      - name: Download UUP dump conversion package
+        run: |
+          BUILD_ID="${{ steps.build.outputs.id }}"
+          # Encode semicolons for the URL
+          EDITIONS_URL="${{ env.EDITIONS }}"
+          EDITIONS_URL="${EDITIONS_URL//;/%3B}"
+
+          echo "Downloading conversion package for $BUILD_ID ..."
+          curl -sfL \
+            "https://uupdump.net/get.php?id=${BUILD_ID}&pack=${{ env.LANG_CODE }}&edition=${EDITIONS_URL}&autodl=2" \
+            -o uup_package.zip
+
+          echo "Package: $(du -h uup_package.zip | cut -f1)"
+          unzip -o uup_package.zip
+          ls -la
+
+      - name: Configure conversion options
+        run: |
+          if [[ ! -f ConvertConfig.ini ]]; then
+            echo "ConvertConfig.ini not found — skipping config step"
+            ls -la
+          else
+            # Include updates
+            sed -i '/^AddUpdates=/s/.*/AddUpdates=1/' ConvertConfig.ini
+            # Component cleanup
+            sed -i '/^Cleanup=/s/.*/Cleanup=1/' ConvertConfig.ini
+            # .NET Framework 3.5
+            sed -i '/^NetFx3=/s/.*/NetFx3=1/' ConvertConfig.ini
+            # Apply LCU to WinRE
+            sed -i '/^LCUwinre=/s/.*/LCUwinre=1/' ConvertConfig.ini
+            echo "--- ConvertConfig.ini ---"
+            cat ConvertConfig.ini
+          fi
+
+      - name: Run download and conversion
+        run: |
+          chmod +x uup_download_linux.sh
+          bash uup_download_linux.sh 2>&1 | tee build.log
+          echo "--- Disk usage after conversion ---"
+          df -h
+
+      - name: Locate ISO file
+        id: iso
+        run: |
+          ISO=$(ls *.iso 2>/dev/null | head -1)
+          if [[ -z "$ISO" ]]; then
+            echo "::error::No ISO file produced. Tail of build log:"
+            tail -100 build.log
+            exit 1
+          fi
+          echo "ISO: $ISO  ($(du -h "$ISO" | cut -f1))"
+          echo "file=$ISO" >> "$GITHUB_OUTPUT"
+
+      - name: Split ISO into 2 GB chunks
+        id: split
+        run: |
+          ISO="${{ steps.iso.outputs.file }}"
+          BASE="${ISO%.iso}"
+
+          split -b 2000M --numeric-suffixes=1 --suffix-length=3 "$ISO" "${BASE}.part"
+          rm "$ISO"
+
+          CHUNKS=$(ls "${BASE}.part"* | wc -l)
+          echo "Split into $CHUNKS chunks:"
+          ls -lah "${BASE}.part"*
+
+          echo "basename=$BASE"   >> "$GITHUB_OUTPUT"
+          echo "chunks=$CHUNKS"   >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub release
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BUILD_ID="${{ steps.build.outputs.id }}"
+          TITLE="${{ steps.build.outputs.title }}"
+          BUILD_NUM="${{ steps.build.outputs.build_num }}"
+          CHUNKS="${{ steps.split.outputs.chunks }}"
+          TAG="win11-$(date -u +%Y%m%d-%H%M%S)"
+
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TITLE" \
+            --latest \
+            --notes "## $TITLE
+
+          | Field | Value |
+          |-------|-------|
+          | Build ID | \`${BUILD_ID}\` |
+          | Build number | ${BUILD_NUM} |
+          | Language | English (United States) |
+          | Architecture | amd64 |
+          | Parts | ${CHUNKS} × 2 GB |
+
+          ### Editions included
+          - Windows Home
+          - Windows Home Single Language
+          - Windows Pro
+          - Windows Pro for Workstations
+          - Windows Pro Education
+          - Windows Education
+          - Windows Enterprise
+          - Windows Enterprise multi-session / Virtual Desktops
+          - Windows IoT Enterprise
+          - Windows IoT Enterprise Subscription
+
+          ### Conversion options applied
+          - Updates integrated
+          - Component cleanup
+          - .NET Framework 3.5 integrated
+          - Solid (ESD) compression
+
+          ### Reassemble ISO
+          \`\`\`bash
+          # Linux / macOS
+          cat *.part* > Windows11.iso
+          \`\`\`
+          \`\`\`powershell
+          # PowerShell (Windows)
+          \$out = [IO.File]::Create('Windows11.iso')
+          Get-ChildItem *.part* | Sort-Object Name | ForEach-Object {
+              \$bytes = [IO.File]::ReadAllBytes(\$_.FullName)
+              \$out.Write(\$bytes, 0, \$bytes.Length)
+          }
+          \$out.Close()
+          \`\`\`"
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Upload chunks to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.release.outputs.tag }}"
+          BASE="${{ steps.split.outputs.basename }}"
+
+          for chunk in "${BASE}.part"*; do
+            echo "Uploading $chunk  ($(du -h "$chunk" | cut -f1)) ..."
+            gh release upload "$TAG" "$chunk" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+          done
+
+      - name: Upload build log artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ github.run_id }}
+          path: build.log
+          retention-days: 7
