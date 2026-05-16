@@ -125,10 +125,33 @@ jobs:
                   "&virtualEditions%5B%5D=IoTEnterprise" +
                   "&virtualEditions%5B%5D=IoTEnterpriseK"
 
-          Write-Host "Downloading conversion package for build $buildId ..."
-          Invoke-WebRequest -Uri $uri -Method POST -Body $body `
-            -ContentType 'application/x-www-form-urlencoded' `
-            -OutFile uup_package.zip
+          # Retry with exponential backoff — UUP dump rate-limits by IP
+          $delay = 20
+          for ($attempt = 1; $attempt -le 10; $attempt++) {
+            Write-Host "Attempt $attempt/10 — downloading package for $buildId ..."
+            $resp = Invoke-WebRequest -Uri $uri -Method POST -Body $body `
+              -ContentType 'application/x-www-form-urlencoded' `
+              -SkipHttpErrorCheck -OutFile uup_package.zip -PassThru
+
+            $size = (Get-Item uup_package.zip).Length
+            Write-Host "  HTTP $($resp.StatusCode), $size bytes"
+
+            if ($resp.StatusCode -eq 200 -and $size -gt 5000) {
+              Write-Host "Package downloaded OK."
+              break
+            }
+
+            if ($attempt -eq 10) {
+              Write-Host "Response body preview:"
+              Get-Content uup_package.zip -Raw | Select-Object -First 1 | ForEach-Object { $_.Substring(0, [math]::Min(300, $_.Length)) }
+              Write-Error "Failed to download package after 10 attempts."
+              exit 1
+            }
+
+            Write-Host "  Rate-limited or error — waiting ${delay}s before retry..."
+            Start-Sleep -Seconds $delay
+            $delay = [math]::Min($delay * 2, 120)
+          }
 
           $mb = [math]::Round((Get-Item uup_package.zip).Length / 1MB, 1)
           Write-Host "Package: ${mb} MB"
