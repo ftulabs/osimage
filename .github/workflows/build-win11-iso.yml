@@ -73,21 +73,19 @@ jobs:
             $title    = "Windows 11 ($buildId)"
             $buildNum = $buildId
           } else {
-            Write-Host "Querying UUP dump API for latest Windows 11 retail build..."
+            Write-Host "Searching UUP dump for latest Windows 11 amd64 build..."
             $resp = Invoke-RestMethod `
-              "https://api.uupdump.net/fetchupd.php?arch=${{ env.ARCH }}&ring=RETAIL&flight=Active"
+              "https://api.uupdump.net/listid.php?search=Windows+11&sortByDate=1"
 
-            $update = $resp.response.updateArray |
-              Where-Object { [System.Version]($_.build + '.0') -ge [System.Version]'22000.0' } |
+            # builds is a dict keyed by UUID; grab values, filter amd64, take newest
+            $update = $resp.response.builds.PSObject.Properties.Value |
+              Where-Object { $_.arch -eq 'amd64' } |
+              Sort-Object created -Descending |
               Select-Object -First 1
 
             if (-not $update) {
-              Write-Host "Fallback: searching via listid..."
-              $resp   = Invoke-RestMethod `
-                "https://api.uupdump.net/listid.php?search=Windows+11&sortByDate=1"
-              $update = $resp.response.builds.PSObject.Properties.Value |
-                Sort-Object created -Descending |
-                Select-Object -First 1
+              Write-Error "No Windows 11 amd64 build found via UUP dump API."
+              exit 1
             }
 
             $buildId  = $update.uuid
