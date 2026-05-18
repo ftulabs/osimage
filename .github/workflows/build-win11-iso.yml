@@ -250,19 +250,20 @@ jobs:
           - Solid (ESD) compression
 
           ### Get the ISO
-          Download just **one** of the helper scripts below — it knows this release's
-          tag and chunks, downloads them itself, and writes the full ``<basename>.iso``
-          next to itself.
+          The repo is **private** — you need the [GitHub CLI](https://cli.github.com/)
+          authenticated (``gh auth login``). The helper script knows this release's
+          tag and chunks; it downloads them via ``gh`` and writes the full
+          ``<basename>.iso`` next to itself.
 
-          ```powershell
-          # PowerShell (Windows / cross-platform)
-          iwr -Uri 'https://github.com/${{ github.repository }}/releases/download/$tag/reassemble.ps1' -OutFile reassemble.ps1
-          .\reassemble.ps1
-          ```
           ```bash
           # Linux / macOS
-          curl -LO 'https://github.com/${{ github.repository }}/releases/download/$tag/reassemble.sh'
+          gh release download $tag --repo ${{ github.repository }} --pattern reassemble.sh
           bash reassemble.sh
+          ```
+          ```powershell
+          # PowerShell (Windows / cross-platform)
+          gh release download $tag --repo ${{ github.repository }} --pattern reassemble.ps1
+          .\reassemble.ps1
           ```
           "@ | Out-File notes.md -Encoding UTF8
 
@@ -290,7 +291,7 @@ jobs:
 
           $psContent = @"
           # Reassemble $base.iso from chunks published in GitHub release $tag.
-          # Run anywhere — script auto-downloads missing parts then concatenates them.
+          # The repo is private — requires GitHub CLI (gh) authenticated.
           #
           #   pwsh ./reassemble.ps1   (cross-platform)
           #   .\reassemble.ps1        (Windows PowerShell)
@@ -305,15 +306,27 @@ jobs:
           `$here = if (`$PSScriptRoot) { `$PSScriptRoot } else { (Get-Location).Path }
           Set-Location `$here
 
+          `$missing = @()
           foreach (`$p in `$parts) {
               `$file = Join-Path `$here "`$base.`$p"
-              if (Test-Path `$file) { Write-Host "[skip] `$base.`$p"; continue }
-              `$url = "https://github.com/`$repo/releases/download/`$tag/`$base.`$p"
-              Write-Host "[down] `$url"
-              Invoke-WebRequest -Uri `$url -OutFile `$file -UseBasicParsing
+              if (Test-Path `$file) { Write-Host "[skip] `$base.`$p" }
+              else { `$missing += "`$base.`$p" }
+          }
+
+          if (`$missing.Count -gt 0) {
+              if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
+                  Write-Error "gh CLI required to download from private repo `$repo. Install https://cli.github.com/ then run: gh auth login"
+                  exit 1
+              }
+              `$args = @('release', 'download', `$tag, '--repo', `$repo, '--dir', `$here)
+              foreach (`$f in `$missing) { `$args += @('--pattern', `$f) }
+              Write-Host "[down] `$(`$missing.Count) parts via gh release download"
+              & gh @args
+              if (`$LASTEXITCODE -ne 0) { Write-Error "gh release download failed"; exit `$LASTEXITCODE }
           }
 
           `$out    = Join-Path `$here "`$base.iso"
+          Write-Host "Writing `$base.iso ..."
           `$buf    = New-Object byte[] (16 * 1024 * 1024)
           `$writer = [IO.File]::Create(`$out)
           try {
@@ -335,7 +348,7 @@ jobs:
           $shContent = @"
           #!/usr/bin/env bash
           # Reassemble $base.iso from chunks published in GitHub release $tag.
-          # Run anywhere — script auto-downloads missing parts then concatenates them.
+          # The repo is private — requires GitHub CLI (gh) authenticated.
           #
           #   bash reassemble.sh
           #   ./reassemble.sh
@@ -350,18 +363,32 @@ jobs:
           here="`$(cd "`$(dirname "`${BASH_SOURCE[0]}")" && pwd)"
           cd "`$here"
 
+          missing=()
           for p in "`${PARTS[@]}"; do
-              file="`$BASE.`$p"
-              if [[ -f "`$file" ]]; then
-                  echo "[skip] `$file"
-                  continue
+              if [[ -f "`$BASE.`$p" ]]; then
+                  echo "[skip] `$BASE.`$p"
+              else
+                  missing+=("`$BASE.`$p")
               fi
-              url="https://github.com/`$REPO/releases/download/`$TAG/`$file"
-              echo "[down] `$url"
-              curl -L --fail --progress-bar -o "`$file" "`$url"
           done
 
+          if (( `${#missing[@]} > 0 )); then
+              if ! command -v gh >/dev/null 2>&1; then
+                  echo "ERROR: gh CLI is required to download from private repo `$REPO" >&2
+                  echo "Install:  https://cli.github.com/" >&2
+                  echo "Auth:     gh auth login" >&2
+                  exit 1
+              fi
+              args=(release download "`$TAG" --repo "`$REPO" --dir "`$here")
+              for f in "`${missing[@]}"; do
+                  args+=(--pattern "`$f")
+              done
+              echo "[down] `${#missing[@]} parts via gh release download"
+              gh "`${args[@]}"
+          fi
+
           out="`$BASE.iso"
+          echo "Writing `$out ..."
           : > "`$out"
           for p in "`${PARTS[@]}"; do
               cat "`$BASE.`$p" >> "`$out"
