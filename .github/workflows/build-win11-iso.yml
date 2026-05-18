@@ -249,19 +249,20 @@ jobs:
           - .NET Framework 3.5 integrated
           - Solid (ESD) compression
 
-          ### Reassemble ISO
+          ### Get the ISO
+          Download just **one** of the helper scripts below — it knows this release's
+          tag and chunks, downloads them itself, and writes the full ``<basename>.iso``
+          next to itself.
+
           ```powershell
-          # PowerShell (Windows)
-          `$out = [IO.File]::Create('Windows11.iso')
-          Get-ChildItem *.part* | Sort-Object Name | ForEach-Object {
-              `$bytes = [IO.File]::ReadAllBytes(`$_.FullName)
-              `$out.Write(`$bytes, 0, `$bytes.Length)
-          }
-          `$out.Close()
+          # PowerShell (Windows / cross-platform)
+          iwr -Uri 'https://github.com/${{ github.repository }}/releases/download/$tag/reassemble.ps1' -OutFile reassemble.ps1
+          .\reassemble.ps1
           ```
           ```bash
           # Linux / macOS
-          cat *.part* > Windows11.iso
+          curl -LO 'https://github.com/${{ github.repository }}/releases/download/$tag/reassemble.sh'
+          bash reassemble.sh
           ```
           "@ | Out-File notes.md -Encoding UTF8
 
@@ -273,7 +274,118 @@ jobs:
 
           "tag=$tag" >> $env:GITHUB_OUTPUT
 
-      - name: Upload chunks to release
+      - name: Generate per-release reassembly scripts
+        shell: pwsh
+        run: |
+          $repo = $env:GITHUB_REPOSITORY
+          $tag  = '${{ steps.release.outputs.tag }}'
+          $base = '${{ steps.split.outputs.basename }}'
+
+          $partFiles = Get-ChildItem "${base}.part*" | Sort-Object Name
+          $partSuffixes = $partFiles | ForEach-Object {
+            ($_.Name -replace [regex]::Escape("$base."), '')
+          }
+          $psList = ($partSuffixes | ForEach-Object { "'$_'" }) -join ', '
+          $shList = ($partSuffixes -join ' ')
+
+          $psContent = @"
+          # Reassemble $base.iso from chunks published in GitHub release $tag.
+          # Run anywhere — script auto-downloads missing parts then concatenates them.
+          #
+          #   pwsh ./reassemble.ps1   (cross-platform)
+          #   .\reassemble.ps1        (Windows PowerShell)
+
+          `$ErrorActionPreference = 'Stop'
+
+          `$repo  = '$repo'
+          `$tag   = '$tag'
+          `$base  = '$base'
+          `$parts = @($psList)
+
+          `$here = if (`$PSScriptRoot) { `$PSScriptRoot } else { (Get-Location).Path }
+          Set-Location `$here
+
+          foreach (`$p in `$parts) {
+              `$file = Join-Path `$here "`$base.`$p"
+              if (Test-Path `$file) { Write-Host "[skip] `$base.`$p"; continue }
+              `$url = "https://github.com/`$repo/releases/download/`$tag/`$base.`$p"
+              Write-Host "[down] `$url"
+              Invoke-WebRequest -Uri `$url -OutFile `$file -UseBasicParsing
+          }
+
+          `$out    = Join-Path `$here "`$base.iso"
+          `$buf    = New-Object byte[] (16 * 1024 * 1024)
+          `$writer = [IO.File]::Create(`$out)
+          try {
+              foreach (`$p in `$parts) {
+                  `$file = Join-Path `$here "`$base.`$p"
+                  `$reader = [IO.File]::OpenRead(`$file)
+                  try {
+                      while ((`$n = `$reader.Read(`$buf, 0, `$buf.Length)) -gt 0) {
+                          `$writer.Write(`$buf, 0, `$n)
+                      }
+                  } finally { `$reader.Close() }
+              }
+          } finally { `$writer.Close() }
+
+          `$gb = [math]::Round((Get-Item `$out).Length / 1GB, 2)
+          Write-Host "Done. `$base.iso (`$gb GB)"
+          "@
+
+          $shContent = @"
+          #!/usr/bin/env bash
+          # Reassemble $base.iso from chunks published in GitHub release $tag.
+          # Run anywhere — script auto-downloads missing parts then concatenates them.
+          #
+          #   bash reassemble.sh
+          #   ./reassemble.sh
+
+          set -euo pipefail
+
+          REPO='$repo'
+          TAG='$tag'
+          BASE='$base'
+          PARTS=($shList)
+
+          here="`$(cd "`$(dirname "`${BASH_SOURCE[0]}")" && pwd)"
+          cd "`$here"
+
+          for p in "`${PARTS[@]}"; do
+              file="`$BASE.`$p"
+              if [[ -f "`$file" ]]; then
+                  echo "[skip] `$file"
+                  continue
+              fi
+              url="https://github.com/`$REPO/releases/download/`$TAG/`$file"
+              echo "[down] `$url"
+              curl -L --fail --progress-bar -o "`$file" "`$url"
+          done
+
+          out="`$BASE.iso"
+          : > "`$out"
+          for p in "`${PARTS[@]}"; do
+              cat "`$BASE.`$p" >> "`$out"
+          done
+
+          if size=`$(stat -c%s "`$out" 2>/dev/null); then :; else size=`$(stat -f%z "`$out"); fi
+          gb=`$(awk -v b="`$size" 'BEGIN { printf "%.2f", b/1024/1024/1024 }')
+          echo "Done. `$out (`${gb} GB)"
+          "@
+
+          # Normalize to LF line endings and UTF-8 without BOM
+          $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+          $psLF = ($psContent -replace "`r`n", "`n").TrimEnd() + "`n"
+          $shLF = ($shContent -replace "`r`n", "`n").TrimEnd() + "`n"
+
+          [IO.File]::WriteAllText((Join-Path $PWD 'reassemble.ps1'), $psLF, $utf8NoBom)
+          [IO.File]::WriteAllText((Join-Path $PWD 'reassemble.sh'),  $shLF, $utf8NoBom)
+
+          Write-Host "--- reassemble.ps1 (first 25 lines) ---"
+          Get-Content reassemble.ps1 | Select-Object -First 25
+          Write-Host "--- reassemble.sh (first 25 lines) ---"
+          Get-Content reassemble.sh | Select-Object -First 25
+
+      - name: Upload chunks and helper scripts to release
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -281,10 +393,14 @@ jobs:
           $tag  = '${{ steps.release.outputs.tag }}'
           $base = '${{ steps.split.outputs.basename }}'
 
-          Get-ChildItem "${base}.part*" | Sort-Object Name | ForEach-Object {
-            $mb = [math]::Round($_.Length / 1MB)
-            Write-Host "Uploading $($_.Name)  (${mb} MB) ..."
-            gh release upload $tag $_.FullName --repo $env:GITHUB_REPOSITORY --clobber
+          $files = @(Get-ChildItem "${base}.part*" | Sort-Object Name) +
+                   @(Get-Item reassemble.sh) +
+                   @(Get-Item reassemble.ps1)
+
+          foreach ($f in $files) {
+            $mb = [math]::Round($f.Length / 1MB, 2)
+            Write-Host "Uploading $($f.Name)  (${mb} MB) ..."
+            gh release upload $tag $f.FullName --repo $env:GITHUB_REPOSITORY --clobber
           }
 
       - name: Upload build log artifact
