@@ -68,9 +68,28 @@ jobs:
           } else {
             # fetchupd.php?arch=amd64&ring=retail returns an HTML page listing retail builds.
             # Parse UUIDs and build numbers, then pick the highest build for amd64.
-            Write-Host "Fetching latest retail Windows 11 builds..."
-            $html = Invoke-WebRequest -Uri "https://uupdump.net/fetchupd.php?arch=amd64&ring=retail" |
-              Select-Object -ExpandProperty Content
+            # Retry with backoff — UUP dump's upstream query to Windows Update can fail transiently.
+            $html = $null
+            $delay = 20
+            for ($attempt = 1; $attempt -le 8; $attempt++) {
+              Write-Host "Fetching latest retail Windows 11 builds (attempt $attempt/8)..."
+              try {
+                $resp = Invoke-WebRequest -Uri "https://uupdump.net/fetchupd.php?arch=amd64&ring=retail" -SkipHttpErrorCheck
+                if ($resp.StatusCode -eq 200 -and $resp.Content -notmatch 'A request to the Windows Update service has failed') {
+                  $html = $resp.Content
+                  break
+                }
+                Write-Host "  HTTP $($resp.StatusCode), or upstream WU error — waiting ${delay}s..."
+              } catch {
+                Write-Host "  Exception: $($_.Exception.Message) — waiting ${delay}s..."
+              }
+              if ($attempt -eq 8) {
+                Write-Error "fetchupd.php kept failing after 8 attempts. Try specifying build_id manually."
+                exit 1
+              }
+              Start-Sleep -Seconds $delay
+              $delay = [math]::Min($delay * 2, 120)
+            }
 
             $uuids  = [regex]::Matches($html, '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}') |
               ForEach-Object { $_.Value } | Select-Object -Unique
