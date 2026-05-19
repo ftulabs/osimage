@@ -269,19 +269,18 @@ jobs:
           - Solid (ESD) compression
 
           ### Get the ISO
-          The repo is **private** — you need the [GitHub CLI](https://cli.github.com/)
-          authenticated (``gh auth login``). The helper script knows this release's
-          tag and chunks; it downloads them via ``gh`` and writes the full
+          The helper script knows this release's tag and chunks. It pulls all
+          parts in parallel from this release and writes the full
           ``<basename>.iso`` next to itself.
 
           ```bash
           # Linux / macOS
-          gh release download $tag --repo ${{ github.repository }} --pattern reassemble.sh
+          curl -LO 'https://github.com/${{ github.repository }}/releases/download/$tag/reassemble.sh'
           bash reassemble.sh
           ```
           ```powershell
-          # PowerShell (Windows / cross-platform)
-          gh release download $tag --repo ${{ github.repository }} --pattern reassemble.ps1
+          # PowerShell 7+ (Windows / cross-platform)
+          iwr -Uri 'https://github.com/${{ github.repository }}/releases/download/$tag/reassemble.ps1' -OutFile reassemble.ps1
           .\reassemble.ps1
           ```
           "@ | Out-File notes.md -Encoding UTF8
@@ -310,10 +309,11 @@ jobs:
 
           $psContent = @"
           # Reassemble $base.iso from chunks published in GitHub release $tag.
-          # The repo is private — requires GitHub CLI (gh) authenticated.
+          # Downloads all parts in parallel via plain HTTPS (the repo is public).
+          # Requires PowerShell 7+ for ForEach-Object -Parallel.
           #
           #   pwsh ./reassemble.ps1   (cross-platform)
-          #   .\reassemble.ps1        (Windows PowerShell)
+          #   .\reassemble.ps1        (Windows PowerShell 7+)
 
           `$ErrorActionPreference = 'Stop'
 
@@ -321,6 +321,11 @@ jobs:
           `$tag   = '$tag'
           `$base  = '$base'
           `$parts = @($psList)
+
+          if (`$PSVersionTable.PSVersion.Major -lt 7) {
+              Write-Error "PowerShell 7+ required. Install: https://aka.ms/PSWindows"
+              exit 1
+          }
 
           `$here = if (`$PSScriptRoot) { `$PSScriptRoot } else { (Get-Location).Path }
           Set-Location `$here
@@ -333,15 +338,16 @@ jobs:
           }
 
           if (`$missing.Count -gt 0) {
-              if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
-                  Write-Error "gh CLI required to download from private repo `$repo. Install https://cli.github.com/ then run: gh auth login"
-                  exit 1
-              }
-              `$args = @('release', 'download', `$tag, '--repo', `$repo, '--dir', `$here)
-              foreach (`$f in `$missing) { `$args += @('--pattern', `$f) }
-              Write-Host "[down] `$(`$missing.Count) parts via gh release download"
-              & gh @args
-              if (`$LASTEXITCODE -ne 0) { Write-Error "gh release download failed"; exit `$LASTEXITCODE }
+              Write-Host "[down] `$(`$missing.Count) parts in parallel..."
+              `$missing | ForEach-Object -Parallel {
+                  `$ErrorActionPreference = 'Stop'
+                  `$f    = `$_
+                  `$url  = "https://github.com/`$(`$using:repo)/releases/download/`$(`$using:tag)/`$f"
+                  `$dst  = Join-Path `$using:here `$f
+                  Write-Host "  -> `$f"
+                  Invoke-WebRequest -Uri `$url -OutFile `$dst -UseBasicParsing
+                  Write-Host "  OK `$f"
+              } -ThrottleLimit ([Math]::Min(`$missing.Count, 4))
           }
 
           `$out    = Join-Path `$here "`$base.iso"
@@ -367,7 +373,8 @@ jobs:
           $shContent = @"
           #!/usr/bin/env bash
           # Reassemble $base.iso from chunks published in GitHub release $tag.
-          # The repo is private — requires GitHub CLI (gh) authenticated.
+          # Downloads all parts in parallel via plain HTTPS (the repo is public).
+          # Requires: curl.
           #
           #   bash reassemble.sh
           #   ./reassemble.sh
@@ -392,18 +399,26 @@ jobs:
           done
 
           if (( `${#missing[@]} > 0 )); then
-              if ! command -v gh >/dev/null 2>&1; then
-                  echo "ERROR: gh CLI is required to download from private repo `$REPO" >&2
-                  echo "Install:  https://cli.github.com/" >&2
-                  echo "Auth:     gh auth login" >&2
+              command -v curl >/dev/null 2>&1 || { echo "ERROR: curl is required" >&2; exit 1; }
+              echo "[down] `${#missing[@]} parts in parallel..."
+              pids=()
+              for f in "`${missing[@]}"; do
+                  (
+                      url="https://github.com/`$REPO/releases/download/`$TAG/`$f"
+                      echo "  -> `$f"
+                      curl -L --fail -sS -o "`$f" "`$url"
+                      echo "  OK `$f"
+                  ) &
+                  pids+=(`$!)
+              done
+              failed=0
+              for pid in "`${pids[@]}"; do
+                  wait "`$pid" || failed=`$((failed + 1))
+              done
+              if (( failed > 0 )); then
+                  echo "ERROR: `$failed parallel downloads failed" >&2
                   exit 1
               fi
-              args=(release download "`$TAG" --repo "`$REPO" --dir "`$here")
-              for f in "`${missing[@]}"; do
-                  args+=(--pattern "`$f")
-              done
-              echo "[down] `${#missing[@]} parts via gh release download"
-              gh "`${args[@]}"
           fi
 
           out="`$BASE.iso"
